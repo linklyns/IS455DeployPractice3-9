@@ -6,10 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "import:shop-db": "node scripts/import_shop_db_to_supabase.js"
   },
   "dependencies": {
     "next": "^15.5.14",
+    "pg": "^8.13.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "sql.js": "^1.11.0"

@@ -1,4 +1,4 @@
-const { openDatabase, persistDatabase, queryAll, queryOne } = require('./sqlite');
+const { queryAll, queryOne } = require('./postgres');
 
 function toNumber(value) {
   const numericValue = Number(value);
@@ -55,7 +55,7 @@ function buildOrderSearchClause(searchTerm) {
         COALESCE(o.device_type, '') || ' ' ||
         COALESCE(o.ip_country, '') || ' ' ||
         COALESCE(o.promo_code, '')
-      ) LIKE ?
+      ) LIKE $1
     `,
     parameters: [`%${normalizedSearchTerm}%`],
   };
@@ -94,129 +94,104 @@ function mapOrder(order) {
 }
 
 async function getDashboardData({ page = 1, pageSize = 50, searchTerm = '' } = {}) {
-  const { database, databasePath } = await openDatabase();
+  const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+  const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? pageSize : 50;
+  const offset = (safePage - 1) * safePageSize;
+  const { whereClause, parameters } = buildOrderSearchClause(searchTerm);
 
-  try {
-    const safePage = Number.isInteger(page) && page > 0 ? page : 1;
-    const safePageSize = Number.isInteger(pageSize) && pageSize > 0 ? pageSize : 50;
-    const offset = (safePage - 1) * safePageSize;
-    const { whereClause, parameters } = buildOrderSearchClause(searchTerm);
+  const statsRow = await queryOne(
+    `
+      SELECT
+        COUNT(*) AS totalOrders,
+        SUM(CASE WHEN f.feedback_label IS NOT NULL THEN 1 ELSE 0 END) AS reviewedOrders,
+        SUM(CASE WHEN o.risk_score >= 70 THEN 1 ELSE 0 END) AS highRiskOrders,
+        AVG(o.risk_score) AS averageRiskScore
+      FROM orders o
+      JOIN customers c ON c.customer_id = o.customer_id
+      LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
+    `
+  );
 
-    const statsRow = queryOne(
-      database,
-      `
-        SELECT
-          COUNT(*) AS totalOrders,
-          SUM(CASE WHEN f.feedback_label IS NOT NULL THEN 1 ELSE 0 END) AS reviewedOrders,
-          SUM(CASE WHEN o.risk_score >= 70 THEN 1 ELSE 0 END) AS highRiskOrders,
-          AVG(o.risk_score) AS averageRiskScore
-        FROM orders o
-        JOIN customers c ON c.customer_id = o.customer_id
-        LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
-      `
-    );
+  const totalMatchesRow = await queryOne(
+    `
+      SELECT COUNT(*) AS totalMatches
+      FROM orders o
+      JOIN customers c ON c.customer_id = o.customer_id
+      LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
+      ${whereClause}
+    `,
+    parameters
+  );
 
-    const totalMatchesRow = queryOne(
-      database,
-      `
-        SELECT COUNT(*) AS totalMatches
-        FROM orders o
-        JOIN customers c ON c.customer_id = o.customer_id
-        LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
-        ${whereClause}
-      `,
-      parameters
-    );
+  const parameterOffset = parameters.length;
+  const orders = await queryAll(
+    `
+      SELECT
+        o.order_id,
+        o.customer_id,
+        o.order_datetime,
+        o.order_subtotal,
+        o.shipping_fee,
+        o.tax_amount,
+        o.order_total,
+        o.payment_method,
+        o.device_type,
+        o.ip_country,
+        o.promo_used,
+        o.promo_code,
+        o.risk_score,
+        o.is_fraud,
+        c.full_name,
+        c.email,
+        c.city,
+        c.state,
+        c.customer_segment,
+        c.loyalty_tier,
+        f.feedback_label,
+        f.review_notes,
+        f.reviewed_at
+      FROM orders o
+      JOIN customers c ON c.customer_id = o.customer_id
+      LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
+      ${whereClause}
+      ORDER BY o.risk_score DESC, o.order_datetime DESC, o.order_id DESC
+      LIMIT $${parameterOffset + 1} OFFSET $${parameterOffset + 2}
+    `,
+    [...parameters, safePageSize, offset]
+  );
 
-    const orders = queryAll(
-      database,
-      `
-        SELECT
-          o.order_id,
-          o.customer_id,
-          o.order_datetime,
-          o.order_subtotal,
-          o.shipping_fee,
-          o.tax_amount,
-          o.order_total,
-          o.payment_method,
-          o.device_type,
-          o.ip_country,
-          o.promo_used,
-          o.promo_code,
-          o.risk_score,
-          o.is_fraud,
-          c.full_name,
-          c.email,
-          c.city,
-          c.state,
-          c.customer_segment,
-          c.loyalty_tier,
-          f.feedback_label,
-          f.review_notes,
-          f.reviewed_at
-        FROM orders o
-        JOIN customers c ON c.customer_id = o.customer_id
-        LEFT JOIN fraud_feedback f ON f.order_id = o.order_id
-        ${whereClause}
-        ORDER BY o.risk_score DESC, o.order_datetime DESC, o.order_id DESC
-        LIMIT ? OFFSET ?
-      `,
-      [...parameters, safePageSize, offset]
-    ).map(mapOrder);
+  const stats = {
+    totalOrders: toNumber(statsRow?.totalOrders),
+    reviewedOrders: toNumber(statsRow?.reviewedOrders),
+    highRiskOrders: toNumber(statsRow?.highRiskOrders),
+    averageRiskScore: toNumber(statsRow?.averageRiskScore),
+  };
 
-    const stats = {
-      totalOrders: toNumber(statsRow?.totalOrders),
-      reviewedOrders: toNumber(statsRow?.reviewedOrders),
-      highRiskOrders: toNumber(statsRow?.highRiskOrders),
-      averageRiskScore: toNumber(statsRow?.averageRiskScore),
-    };
-
-    return {
-      orders,
-      stats,
-      databasePath,
-      page: safePage,
-      pageSize: safePageSize,
-      totalMatches: toNumber(totalMatchesRow?.totalMatches),
-      searchTerm: normalizeText(searchTerm),
-    };
-  } finally {
-    database.close();
-  }
+  return {
+    orders: orders.map(mapOrder),
+    stats,
+    databasePath: 'supabase',
+    page: safePage,
+    pageSize: safePageSize,
+    totalMatches: toNumber(totalMatchesRow?.totalMatches),
+    searchTerm: normalizeText(searchTerm),
+  };
 }
 
 async function saveFeedback({ orderId, feedbackLabel, reviewNotes }) {
-  const { database, databasePath } = await openDatabase();
-
-  try {
-    database.run(
-      `
-        INSERT INTO fraud_feedback (order_id, feedback_label, review_notes, reviewed_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(order_id)
-        DO UPDATE SET
-          feedback_label = excluded.feedback_label,
-          review_notes = excluded.review_notes,
-          reviewed_at = CURRENT_TIMESTAMP
-      `,
-      [orderId, normalizeFeedbackLabel(feedbackLabel), normalizeText(reviewNotes)]
-    );
-
-    persistDatabase(database, databasePath);
-
-    return queryOne(
-      database,
-      `
-        SELECT order_id, feedback_label, review_notes, reviewed_at
-        FROM fraud_feedback
-        WHERE order_id = ?
-      `,
-      [orderId]
-    );
-  } finally {
-    database.close();
-  }
+  return queryOne(
+    `
+      INSERT INTO fraud_feedback (order_id, feedback_label, review_notes, reviewed_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+      ON CONFLICT (order_id)
+      DO UPDATE SET
+        feedback_label = EXCLUDED.feedback_label,
+        review_notes = EXCLUDED.review_notes,
+        reviewed_at = CURRENT_TIMESTAMP
+      RETURNING order_id, feedback_label, review_notes, reviewed_at
+    `,
+    [orderId, normalizeFeedbackLabel(feedbackLabel), normalizeText(reviewNotes)]
+  );
 }
 
 module.exports = {
